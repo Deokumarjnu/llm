@@ -1002,12 +1002,12 @@ export async function generateSQLQuery(question: string, queryContext?: any) {
         
         // Query to get only the first_name of students
         const studentSQL = `
-          SELECT DISTINCT u.first_name
+          SELECT DISTINCT CONCAT(u.first_name, ' ', u.last_name) AS name
           FROM users u
           JOIN institutions_users iu ON u.id = iu.user_id
           WHERE iu.institution_id IN (${schoolIds.join(',')})
             AND iu.deleted_at IS NULL
-          ORDER BY u.first_name
+          ORDER BY u.last_name, u.first_name
         `;
         
         const studentResult = await client.query(studentSQL);
@@ -1165,6 +1165,84 @@ export async function generateSQLQuery(question: string, queryContext?: any) {
     }
   }
 
+  const studentsInDistrictPattern = /(?:all|get|show|list|find)\s+(?:students|users)\s+(?:in|at|for|of|from)\s+(?:district(?:_|\s*)?id|districtid|district|districts)\s*(?:=|:|\s+)?(?:"|')?([^"']+)(?:"|')?/i;
+  const studentsInDistrictMatch = normalizedQuestion.match(studentsInDistrictPattern);
+
+  if (studentsInDistrictMatch && studentsInDistrictMatch[1]) {
+    const districtIdentifier = studentsInDistrictMatch[1].trim();
+    console.log(`Looking for students in district: "${districtIdentifier}"`);
+
+    try {
+      let districtLookupSQL;
+      let districtResult;
+
+      // Check if the district identifier is numeric (likely an ID) or text (likely a name)
+      if (/^\d+$/.test(districtIdentifier)) {
+        // Numeric district ID
+        districtLookupSQL = `SELECT id FROM districts WHERE id = ${districtIdentifier}`;
+      } else {
+        // District name with case-insensitive and partial matching
+        districtLookupSQL = `SELECT id FROM districts WHERE name ILIKE '%${districtIdentifier}%'`;
+      }
+
+      districtResult = await client.query(districtLookupSQL);
+
+      if (districtResult.rows.length > 0) {
+        // We found the district(s) - now get institutions in these districts
+        const districtIds = districtResult.rows.map(row => row.id);
+        console.log(`Found ${districtIds.length} matching districts with IDs: ${districtIds.join(', ')}`);
+
+        // Query to find institutions in the district(s)
+        const institutionsLookupSQL = `
+          SELECT id FROM institutions WHERE district_id IN (${districtIds.join(',')})
+        `;
+        const institutionsResult = await client.query(institutionsLookupSQL);
+
+        if (institutionsResult.rows.length > 0) {
+          // We found institutions in the district - now get students from these institutions
+          const institutionIds = institutionsResult.rows.map(row => row.id);
+          console.log(`Found ${institutionIds.length} institutions in district(s): ${districtIds.join(', ')}`);
+
+          // Query to get students associated with these institutions
+          const studentsSQL = `
+            SELECT DISTINCT CONCAT(u.first_name, ' ', u.last_name) AS name
+            FROM users u
+            JOIN institutions_users iu ON u.id = iu.user_id
+            WHERE iu.institution_id IN (${institutionIds.join(',')})
+              AND iu.deleted_at IS NULL
+            ORDER BY u.last_name, u.first_name
+          `;
+
+          const studentsResult = await client.query(studentsSQL);
+          return {
+            sql: studentsSQL,
+            rows: studentsResult.rows,
+            note: `Found ${studentsResult.rows.length} students in district(s): ${districtIds.join(', ')}`
+          };
+        } else {
+          return {
+            sql: institutionsLookupSQL,
+            rows: [],
+            note: `No institutions found in district(s): ${districtIds.join(', ')}`
+          };
+        }
+      } else {
+        return {
+          sql: districtLookupSQL,
+          rows: [],
+          note: `No districts found matching: "${districtIdentifier}"`
+        };
+      }
+    } catch (err) {
+      console.error("Error querying students in district:", err instanceof Error ? err.message : err);
+      return {
+        sql: "",
+        rows: [],
+        note: `An error occurred while querying students in district: "${districtIdentifier}".`
+      };
+    }
+  }
+
   // Use vector search to find relevant schema info
   const relevant = await vectorStore.similaritySearch(question, 4);
   const context = relevant.map((r) => r.pageContent).join("\n");
@@ -1295,7 +1373,7 @@ Only output the SQL query without explanations.
   if (normalizedQuestion.includes('district') && 
       (normalizedQuestion.includes('school') || normalizedQuestion.includes('institution'))) {
     // Extract district ID if it exists in the query
-    const districtIdMatch = normalizedQuestion.match(/district\s*(?:_|\s+)?id\s*(?:=|:)?\s*(\d+)/i);
+    const districtIdMatch = normalizedQuestion.match(/district\s*(?:\s+id)?\s*(?:=|:)?\s*(\d+)/i);
     
     if (districtIdMatch && districtIdMatch[1]) {
       const districtId = districtIdMatch[1];
@@ -1324,6 +1402,399 @@ Only output the SQL query without explanations.
     }
   }
   
+  // Handle incomplete JOIN syntax for student queries
+  if (processedSQL.includes('JOIN student_tiers ON users.id =') || 
+      processedSQL.includes('JOIN institutions_users ON') ||
+      processedSQL.endsWith('JOIN') || 
+      processedSQL.match(/ON\s+[a-z_.]+\s*$/i)) {
+    
+    // Reconstruct a complete query for students in district
+    if (normalizedQuestion.includes('student') && normalizedQuestion.includes('district')) {
+      const districtMatch = normalizedQuestion.match(/district\s*(?:\s+id)?\s*(?:=|:)?\s*(\d+)/i);
+      if (districtMatch && districtMatch[1]) {
+        const districtId = districtMatch[1];
+        processedSQL = `
+          SELECT DISTINCT CONCAT(u.first_name, ' ', u.last_name) AS name, u.last_name, u.first_name
+          FROM users u
+          JOIN institutions_users iu ON u.id = iu.user_id
+          JOIN institutions i ON iu.institution_id = i.id
+          WHERE i.district_id = ${districtId}
+            AND iu.deleted_at IS NULL
+          ORDER BY u.last_name, u.first_name
+        `;
+        console.log("Fixed incomplete SQL with complete query for district students");
+      }
+    }
+  }
+  
+  // Handle student attendance queries with school name and district filters
+  const absentStudentPattern = /(?:student|students|user|users)(?:.*)(?:absent|absence|not present|missing|missed)(?:.*)(?:in|at|from)\s+([^"']+?)(?:\s+of|\s+in|\s+from|\s+at|\s+for|\s+with)?\s+district\s*(\d+)/i;
+  const absentStudentMatch = normalizedQuestion.match(absentStudentPattern);
+  
+  if (absentStudentMatch && absentStudentMatch[1] && absentStudentMatch[2]) {
+    const schoolName = absentStudentMatch[1].trim();
+    const districtId = absentStudentMatch[2].trim();
+    console.log(`Looking for absent students in ${schoolName} of district ${districtId}`);
+    
+    try {
+      // Check if the query is asking for absences in "any class/school" of a district
+      const isAnySchoolQuery = schoolName.toLowerCase().includes('any') || 
+                              schoolName.toLowerCase() === 'class' || 
+                              schoolName.toLowerCase() === 'classes';
+      
+      if (isAnySchoolQuery) {
+        console.log("Detected query for absences in any school of the district");
+        // Find all absent students across all schools in the specified district
+        const districtAbsentSQL = `
+          SELECT DISTINCT u.id, u.first_name, u.last_name, u.email,
+                 i.name as school_name, 
+                 a.date as absence_date, a.status as absence_status
+          FROM users u
+          JOIN institutions_users iu ON u.id = iu.user_id
+          JOIN institutions i ON iu.institution_id = i.id
+          JOIN attendances a ON u.id = a.user_id
+          WHERE i.district_id = ${districtId}
+            AND iu.deleted_at IS NULL
+            AND a.status ILIKE '%absent%'
+          ORDER BY i.name, u.last_name, u.first_name, a.date DESC
+        `;
+        
+        console.log("Executing district-wide absence query");
+        const absenceResult = await client.query(districtAbsentSQL);
+        
+        return {
+          sql: districtAbsentSQL,
+          rows: absenceResult.rows,
+          note: `Found ${absenceResult.rows.length} absence records across all schools in district ${districtId}`
+        };
+      }
+      
+      // Handle "Elementary School" specifically
+      const isElementarySchool = schoolName.toLowerCase().includes('elementary');
+      
+      // First find the school by name AND district ID - more specific for Elementary School
+      let schoolLookupSQL;
+      if (isElementarySchool) {
+        schoolLookupSQL = `SELECT id, name FROM institutions WHERE name ILIKE '%Elementary School%' AND district_id = ${districtId}`;
+      } else {
+        schoolLookupSQL = `SELECT id, name FROM institutions WHERE name ILIKE '%${schoolName}%' AND district_id = ${districtId}`;
+      }
+      
+      console.log(`Executing school lookup SQL: ${schoolLookupSQL}`);
+      const schoolResult = await client.query(schoolLookupSQL);
+      
+      if (schoolResult.rows.length > 0) {
+        // If school found, find students with absence records
+        const schoolId = schoolResult.rows[0].id;
+        const actualSchoolName = schoolResult.rows[0].name;
+        console.log(`Found school "${actualSchoolName}" with ID ${schoolId}`);
+        
+        // Query to find absent students from this school
+        const absentSQL = `
+          SELECT DISTINCT u.id, u.first_name, u.last_name, u.email, 
+                 a.date as absence_date, a.status as absence_status,
+                 i.name as school_name
+          FROM users u
+          JOIN institutions_users iu ON u.id = iu.user_id
+          JOIN institutions i ON iu.institution_id = i.id
+          JOIN attendances a ON u.id = a.user_id
+          WHERE i.id = ${schoolId}
+            AND i.district_id = ${districtId}
+            AND iu.deleted_at IS NULL
+            AND a.status ILIKE '%absent%'
+          ORDER BY u.last_name, u.first_name, a.date DESC
+        `;
+        
+        console.log(`Executing absent students SQL for school ID ${schoolId}`);
+        const absenceResult = await client.query(absentSQL);
+        
+        if (absenceResult.rows.length > 0) {
+          return {
+            sql: absentSQL,
+            rows: absenceResult.rows,
+            note: `Found ${absenceResult.rows.length} absence records for students in "${actualSchoolName}" (ID: ${schoolId}) in district ${districtId}`
+          };
+        } else {
+          // No absences found, try to get any students from this school
+          const allStudentsSQL = `
+            SELECT u.id, u.first_name, u.last_name, u.email, i.name as school_name
+            FROM users u
+            JOIN institutions_users iu ON u.id = iu.user_id
+            JOIN institutions i ON iu.institution_id = i.id
+            WHERE i.id = ${schoolId}
+              AND i.district_id = ${districtId}
+              AND iu.deleted_at IS NULL
+            ORDER BY u.last_name, u.first_name
+          `;
+          
+          const studentsResult = await client.query(allStudentsSQL);
+          return {
+            sql: allStudentsSQL,
+            rows: studentsResult.rows,
+            note: `Found ${studentsResult.rows.length} students in "${actualSchoolName}" (ID: ${schoolId}) in district ${districtId}, but none have recorded absences`
+          };
+        }
+      } else {
+        // No school found with that name in the specified district
+        // Try a broader search just in case
+        const broadSearchSQL = `SELECT id, name FROM institutions WHERE district_id = ${districtId} AND name ILIKE '%School%'`;
+        const broadResult = await client.query(broadSearchSQL);
+        
+        if (broadResult.rows.length > 0) {
+          return {
+            sql: broadSearchSQL,
+            rows: broadResult.rows,
+            note: `No school found matching exactly "${schoolName}" in district ${districtId}, but found ${broadResult.rows.length} schools that might match. Please select a specific school.`
+          };
+        } else {
+          return {
+            sql: schoolLookupSQL,
+            rows: [],
+            note: `No school found matching "${schoolName}" in district ${districtId}`
+          };
+        }
+      }
+    } catch (err) {
+      console.error("Error in absent student query:", err instanceof Error ? err.message : err);
+      
+      // Try a more general approach without attendance
+      try {
+        const fallbackSQL = `
+          SELECT u.id, u.first_name, u.last_name
+          FROM users u
+          JOIN institutions_users iu ON u.id = iu.user_id
+          JOIN institutions i ON iu.institution_id = i.id
+          WHERE i.name ILIKE '%${schoolName}%'
+            AND i.district_id = ${districtId}
+            AND iu.deleted_at IS NULL
+          ORDER BY u.last_name, u.first_name
+        `;
+        
+        const fallbackResult = await client.query(fallbackSQL);
+        return {
+          sql: fallbackSQL,
+          rows: fallbackResult.rows,
+          note: `Found ${fallbackResult.rows.length} students in ${schoolName} of district ${districtId}, but could not determine absence records`
+        };
+      } catch (fallbackErr) {
+        console.error("Fallback query failed:", fallbackErr instanceof Error ? fallbackErr.message : fallbackErr);
+      }
+    }
+  }
+
+  // Handle direct queries for schools/institutions in a district with simple pattern
+  // This handles both singular (school) and plural (schools) forms with more robust pattern matching
+  const schoolsInDistrictPattern = /(?:all|get|show|list|find|give me)\s+(?:all\s+)?(?:the\s+)?(?:school|schools|institution|institutions)s?\s+(?:associated|connected|linked|related|present|in|for|of|from)\s+(?:district(?:_|\s*)?id|districtid|district|districts)\s*(?:=|:|\s+)?\s*(\d+)/i;
+  const schoolsInDistrictMatch = normalizedQuestion.match(schoolsInDistrictPattern);
+  
+  if (schoolsInDistrictMatch && schoolsInDistrictMatch[1]) {
+    const districtId = schoolsInDistrictMatch[1].trim();
+    console.log(`Detected direct query for schools in district ID: ${districtId}`);
+    
+    try {
+      // Add logging to debug pattern matching issues
+      console.log(`Executing direct SQL for schools in district ${districtId}`);
+      const directSQL = `
+        SELECT * FROM institutions 
+        WHERE district_id = ${districtId}
+        ORDER BY name
+      `;
+      
+      const result = await client.query(directSQL);
+      return {
+        sql: directSQL,
+        rows: result.rows,
+        note: `Found ${result.rows.length} schools/institutions in district ${districtId}`
+      };
+    } catch (err) {
+      console.error("Error in schools-in-district query:", err instanceof Error ? err.message : err);
+      
+      // Fall back to a simpler query if the main one fails
+      try {
+        const fallbackSQL = `SELECT * FROM institutions WHERE district_id = ${districtId}`;
+        const fallbackResult = await client.query(fallbackSQL);
+        return {
+          sql: fallbackSQL,
+          rows: fallbackResult.rows,
+          note: `Found ${fallbackResult.rows.length} schools/institutions in district ${districtId} (fallback query)`
+        };
+      } catch (fallbackErr) {
+        console.error("Even fallback query failed:", fallbackErr instanceof Error ? fallbackErr.message : fallbackErr);
+      }
+    }
+  }
+
+  // Handle "all districts" pattern to list all districts in the database
+  const allDistrictsPattern = /(?:all|get|show|list|find|give me)\s+(?:all\s+)?(?:the\s+)?(?:districts?)\s+(?:present|available|existing|located|found)?\s+(?:in|within|from|at)?\s+(?:the\s+)?(?:database|db|system)?/i;
+  const allDistrictsMatch = normalizedQuestion.match(allDistrictsPattern);
+  
+  if (allDistrictsMatch) {
+    console.log("Detected query for all districts in the database");
+    
+    try {
+      const directSQL = `SELECT * FROM districts ORDER BY name`;
+      const result = await client.query(directSQL);
+      return {
+        sql: directSQL,
+        rows: result.rows,
+        note: `Found ${result.rows.length} districts in the database`
+      };
+    } catch (err) {
+      console.error("Error in all-districts query:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  // Handle specific student detail queries
+  // Improved pattern to match different ways to ask for student details
+  const studentDetailsPattern = /(?:all|get|show|list|find|give me)(?:.*?)(?:(?:all|the)?\s+details|info(?:rmation)?|data)(?:.*?)(?:student|user)(?:.*?)(?:with|having|where|whose)?(?:.*?)(?:first[\s_]?name|name)?(?:.*?)(?:is|=|:|like|'|")?\s*([a-zA-Z\s-]+)(?:'|")?/i;
+  const studentDetailsMatch = normalizedQuestion.match(studentDetailsPattern);
+
+  if (studentDetailsMatch && studentDetailsMatch[1]) {
+    const studentFirstName = studentDetailsMatch[1].trim();
+    console.log(`Looking for comprehensive details for student with first name: "${studentFirstName}"`);
+    
+    // First check if this is a "complete details" type of query with grades, attendance, etc.
+    const isComprehensiveQuery = /(?:grades?|attendance|schools?|parents?|all\s+details)/i.test(normalizedQuestion);
+    
+    try {
+      // If it requires comprehensive details across tables
+      if (isComprehensiveQuery) {
+        // Use a more reliable query that specifies all tables and avoids undefined references
+        const studentDetailsSQL = `
+          SELECT 
+            u.id AS student_id, 
+            u.first_name, 
+            u.last_name, 
+            u.email,
+            u.gender,
+            u.grade AS grade_level,
+            u.birth_date,
+            i.name AS school_name,
+            d.name AS district_name,
+            g.grade_value,
+            c.name AS course_name,
+            a.status AS attendance_status,
+            a.date AS attendance_date,
+            p.first_name AS parent_first_name,
+            p.last_name AS parent_last_name
+          FROM 
+            users u
+          LEFT JOIN institutions_users iu ON u.id = iu.user_id AND iu.deleted_at IS NULL
+          LEFT JOIN institutions i ON iu.institution_id = i.id
+          LEFT JOIN districts d ON i.district_id = d.id
+          LEFT JOIN guardians g2 ON u.id = g2.student_id
+          LEFT JOIN users p ON g2.user_id = p.id
+          LEFT JOIN grades g ON u.id = g.user_id
+          LEFT JOIN courses c ON g.course_id = c.id
+          LEFT JOIN attendances a ON u.id = a.user_id
+          WHERE 
+            u.first_name ILIKE '%${studentFirstName}%'
+        `;
+          
+        try {
+          const result = await client.query(studentDetailsSQL);
+          
+          if (result.rows.length > 0) {
+            return {
+              sql: studentDetailsSQL,
+              rows: result.rows,
+              note: `Found details for student with first name "${studentFirstName}"`
+            };
+          } else {
+            // If no results, try with just the basic student info
+            const basicSQL = `SELECT * FROM users WHERE first_name ILIKE '%${studentFirstName}%'`;
+            const basicResult = await client.query(basicSQL);
+            
+            return {
+              sql: basicSQL,
+              rows: basicResult.rows,
+              note: `Found basic information for student "${studentFirstName}". Additional details like grades, attendance may not be available.`
+            };
+          }
+        } catch (err) {
+          console.error("Comprehensive student query error:", err instanceof Error ? err.message : err);
+          
+          // Try a more simplified approach with separate queries
+          try {
+            // Get basic user information first
+            const userSQL = `SELECT * FROM users WHERE first_name ILIKE '%${studentFirstName}%'`;
+            const userData = await client.query(userSQL);
+            
+            if (userData.rows.length === 0) {
+              return {
+                sql: userSQL,
+                rows: [],
+                note: `No student found with first name containing "${studentFirstName}"`
+              };
+            }
+            
+            // Get the user's ID to use in subsequent queries
+            const userId = userData.rows[0].id;
+            
+            // Get school information
+            const schoolSQL = `
+              SELECT i.name AS school_name, d.name AS district_name 
+              FROM institutions i 
+              JOIN institutions_users iu ON i.id = iu.institution_id 
+              JOIN districts d ON i.district_id = d.id
+              WHERE iu.user_id = ${userId} AND iu.deleted_at IS NULL
+            `;
+            const schoolData = await client.query(schoolSQL).then(r => r.rows).catch(() => []);
+            
+            // Combine the results
+            userData.rows[0].school_info = schoolData;
+            
+            return {
+              sql: userSQL + "; " + schoolSQL,
+              rows: userData.rows,
+              note: `Found basic information for student "${studentFirstName}" with additional school details.`
+            };
+          } catch (simpleErr) {
+            // Absolute fallback: just basic user info
+            const simpleSQL = `SELECT * FROM users WHERE first_name ILIKE '%${studentFirstName}%'`;
+            const simpleResult = await client.query(simpleSQL);
+            
+            return {
+              sql: simpleSQL,
+              rows: simpleResult.rows,
+              note: `Basic information for student "${studentFirstName}" (related information could not be retrieved)`
+            };
+          }
+        }
+      } else {
+        // For simpler queries just asking about a student without needing grades, attendance, etc.
+        const simpleSQL = `SELECT * FROM users WHERE first_name ILIKE '%${studentFirstName}%'`;
+        const { rows } = await client.query(simpleSQL);
+        
+        return {
+          sql: simpleSQL,
+          rows,
+          note: `Basic information for student "${studentFirstName}"`
+        };
+      }
+    } catch (err) {
+      console.error("Error in student details handling:", err instanceof Error ? err.message : err);
+      
+      // Final fallback
+      const fallbackSQL = `SELECT * FROM users WHERE first_name ILIKE '%${studentFirstName}%'`;
+      try {
+        const fallbackResult = await client.query(fallbackSQL);
+        return {
+          sql: fallbackSQL,
+          rows: fallbackResult.rows,
+          note: `Found ${fallbackResult.rows.length} users with first name similar to "${studentFirstName}"`
+        };
+      } catch (finalErr) {
+        return {
+          sql: fallbackSQL,
+          rows: [],
+          error: "Failed to retrieve student information after multiple attempts",
+          note: `No student found with first name similar to "${studentFirstName}"`
+        };
+      }
+    }
+  }
+
   try {
     console.log("Executing SQL:", processedSQL);
     const { rows } = await client.query(processedSQL);
@@ -1337,6 +1808,64 @@ Only output the SQL query without explanations.
     
     // Implement a tiered fallback strategy
     const fallbacks = [
+      // Special Elementary School fallback
+      async () => {
+        if (normalizedQuestion.includes('elementary school')) {
+          // Check if district is mentioned
+          const districtMatch = normalizedQuestion.match(/district\s+(\d+)/i);
+          const districtId = districtMatch ? districtMatch[1] : null;
+          
+          let schoolQuery;
+          if (districtId) {
+            schoolQuery = `
+              SELECT id, name FROM institutions 
+              WHERE name ILIKE '%Elementary School%' AND district_id = ${districtId}
+            `;
+          } else {
+            schoolQuery = `
+              SELECT id, name FROM institutions 
+              WHERE name ILIKE '%Elementary School%'
+            `;
+          }
+          
+          const schoolResult = await client.query(schoolQuery);
+          
+          if (schoolResult.rows.length > 0) {
+            const schoolIds = schoolResult.rows.map(r => r.id).join(',');
+            
+            // Try to get students
+            const studentQuery = `
+              SELECT u.id, u.first_name, u.last_name, i.name as school_name
+              FROM users u
+              JOIN institutions_users iu ON u.id = iu.user_id
+              JOIN institutions i ON iu.institution_id = i.id
+              WHERE iu.institution_id IN (${schoolIds})
+                AND iu.deleted_at IS NULL
+              ORDER BY i.name, u.last_name, u.first_name
+            `;
+            
+            try {
+              const studentResult = await client.query(studentQuery);
+              const districtNote = districtId ? ` in district ${districtId}` : '';
+              return {
+                sql: studentQuery,
+                rows: studentResult.rows,
+                note: `Elementary School fallback: Found ${studentResult.rows.length} students${districtNote}`
+              };
+            } catch (innerErr) {
+              // Return schools if student query fails
+              const districtNote = districtId ? ` in district ${districtId}` : '';
+              return {
+                sql: schoolQuery,
+                rows: schoolResult.rows,
+                note: `Elementary School fallback: Found schools${districtNote} but couldn't retrieve students`
+              };
+            }
+          }
+        }
+        throw new Error("Elementary school fallback failed");
+      },
+      
       // New Fallback 0: Try specific school name query if appropriate
       async () => {
         if (normalizedQuestion.includes('student') && normalizedQuestion.includes('school')) {
